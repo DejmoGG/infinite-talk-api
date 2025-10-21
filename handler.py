@@ -2,108 +2,121 @@
 import os, uuid, json, pathlib, subprocess, requests
 import runpod
 
-def _download(url: str, path: str):
-    r = requests.get(url, stream=True, timeout=180)
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        for chunk in r.iter_content(1 << 14):
-            if chunk:
-                f.write(chunk)
+WEIGHTS_ROOT = pathlib.Path("/app/weights")
+
+CKPT_DIR = WEIGHTS_ROOT / "Wan2.1-I2V-14B-480P"
+WAV2VEC_DIR = WEIGHTS_ROOT / "chinese-wav2vec2-base"
+INF_TALK_DIR = WEIGHTS_ROOT / "InfiniteTalk" / "single" / "infinitetalk.safetensors"
+
+GEN_SCRIPT = "/app/InfiniteTalk/generate_infinitetalk.py"
+
+def _download(url: str, path: pathlib.Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1 << 16):
+                if chunk:
+                    f.write(chunk)
+
+def _run(cmd, cwd=None):
+    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stdout[-4000:])
+    return proc.stdout
 
 def handler(event):
     """
-    Input JSON:
+    Request format (Queue):
     {
       "input": {
-        "image_url": "https://...png",
-        "audio_url": "https://...wav",
-        "quality": "720p" | "1080p"
+        "image_url": "https://...png|jpg",
+        "audio_url": "https://...mp3|wav",
+        "quality": "720p"|"480p"  (use 720p or 480p; we will optionally upscale later)
       }
     }
     """
-    i = event.get("input") or {}
-    image_url = i.get("image_url")
-    audio_url = i.get("audio_url")
-    quality   = (i.get("quality") or "720p").lower()
+    inp = event.get("input") or {}
+    image_url = inp.get("image_url")
+    audio_url = inp.get("audio_url")
+    quality   = (inp.get("quality") or "720p").lower()
 
     if not image_url or not audio_url:
         return {"status": "error", "error": "image_url and audio_url are required"}
 
-    # Prepare workspace
-    job_id = uuid.uuid4().hex
-    work = pathlib.Path(f"/tmp/{job_id}")
-    work.mkdir(parents=True, exist_ok=True)
+    job = pathlib.Path("/tmp") / uuid.uuid4().hex
+    job.mkdir(parents=True, exist_ok=True)
 
-    img_path = work / "input.png"
-    raw_audio = work / "raw_audio"
-    wav_path = work / "input.wav"
+    image_path = job / "input.png"
+    audio_src  = job / "audio_src"
+    audio_wav  = job / "input.wav"
+    request_js = job / "request.json"
 
-    # 1️⃣ Download inputs
-    _download(image_url, str(img_path))
-    _download(audio_url, str(raw_audio))
-
-    # 2️⃣ Normalize audio to 16kHz mono WAV
+    # 1) Download inputs
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(raw_audio),
-                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav_path)
-            ],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-    except subprocess.CalledProcessError as e:
-        return {"status": "error", "error": f"ffmpeg convert failed: {e.stdout.decode()[:4000]}"}
+        _download(image_url, image_path)
+        _download(audio_url, audio_src)
+    except Exception as e:
+        return {"status": "error", "error": f"download failed: {e}"}
 
-    # 3️⃣ Build request.json
-    request_json = work / "request.json"
-    with open(request_json, "w") as f:
-        json.dump({"image": str(img_path), "audio": str(wav_path), "seed": 1}, f)
+    # 2) Normalize audio (16k, mono, pcm_s16le)
+    try:
+        _run([
+            "ffmpeg", "-y", "-i", str(audio_src),
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            str(audio_wav)
+        ])
+    except Exception as e:
+        return {"status": "error", "error": f"ffmpeg convert failed: {e}"}
 
-    # 4️⃣ Run InfiniteTalk
-    size_flag = "infinitetalk-720" if quality in ["720p", "1080p"] else "infinitetalk-480"
+    # 3) Build the input JSON expected by the script (image/audio path references)
+    with open(request_js, "w") as f:
+        json.dump({
+            "image": str(image_path),
+            "audio": str(audio_wav)
+        }, f)
+
+    size_flag = "infinitetalk-720" if quality == "720p" else "infinitetalk-480"
+    save_prefix = "infinitetalk_res"
+
+    # 4) Generate (per README flags)
     cmd = [
-        "python", "/app/InfiniteTalk/generate_infinitetalk.py",
-        "--ckpt_dir", "/app/weights/Wan2.1-I2V-14B-480P",
-        "--wav2vec_dir", "/app/weights/chinese-wav2vec2-base",
-        "--infinitetalk_dir", "/app/weights/InfiniteTalk/single/infinitetalk.safetensors",
-        "--input_json", str(request_json),
+        "python", GEN_SCRIPT,
+        "--ckpt_dir", str(CKPT_DIR),
+        "--wav2vec_dir", str(WAV2VEC_DIR),
+        "--infinitetalk_dir", str(INF_TALK_DIR),
+        "--input_json", str(request_js),
         "--size", size_flag,
         "--sample_steps", "40",
         "--mode", "streaming",
         "--motion_frame", "9",
-        "--save_file", "out_"
+        "--save_file", save_prefix
     ]
 
     try:
-        subprocess.run(cmd, cwd=work, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as e:
-        return {"status": "error", "error": f"InfiniteTalk failed: {e.stdout.decode()[:4000]}"}
-
-    # 5️⃣ Find output video
-    mp4_files = list(work.glob("out_*.mp4"))
-    if not mp4_files:
-        return {"status": "error", "error": "No output video produced"}
-    mp4_path = mp4_files[0]
-
-    # Optional upscale to 1080p
-    if quality == "1080p":
-        upscale_path = work / "out_1080p.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(mp4_path),
-            "-vf", "scale=1920:1080:flags=lanczos",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-c:a", "copy",
-            str(upscale_path)
-        ], check=True)
-        mp4_path = upscale_path
-
-    # 6️⃣ Upload to file.io
-    try:
-        up = subprocess.check_output(["curl", "-sF", f"file=@{mp4_path}", "https://file.io"]).decode("utf-8")
-        video_url = json.loads(up)["link"]
+        gen_log = _run(cmd, cwd=str(job))
     except Exception as e:
-        return {"status": "error", "error": f"Upload failed: {e}"}
+        return {"status": "error", "error": f"InfiniteTalk failed: {e}"}
 
-    return {"status": "done", "video_url": video_url}
+    # 5) Find output
+    mp4 = None
+    for p in job.glob(f"{save_prefix}*.mp4"):
+        mp4 = p
+        break
+    if not mp4:
+        # last-chance scan
+        cands = list(job.glob("*.mp4"))
+        mp4 = cands[0] if cands else None
+    if not mp4:
+        return {"status": "error", "error": "No MP4 produced"}
 
-# Entrypoint
+    # 6) Upload to file.io
+    try:
+        up = subprocess.check_output(["curl", "-sF", f"file=@{mp4}", "https://file.io"]).decode("utf-8")
+        link = json.loads(up)["link"]
+    except Exception as e:
+        return {"status": "error", "error": f"upload failed: {e}"}
+
+    return {"status": "done", "video_url": link}
+
 runpod.serverless.start({"handler": handler})
