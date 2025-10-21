@@ -3,7 +3,7 @@ FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn8-runtime
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1
-
+# start 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
