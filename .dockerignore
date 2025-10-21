@@ -1,6 +1,9 @@
-*
-!Dockerfile
-!bootstrap.py
-!handler.py
-!README.md
-!LICENSE.txt
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.tmp
+*.log
+*.git
+.gitignore
